@@ -1,20 +1,15 @@
-//use futures::executor::LocalPool;
-//use futures::task::{LocalSpawn, SpawnError};
-use futures::Stream;
+use crate::runtime;
 use libc::*;
-use std::cell::RefCell;
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
-//use std::future::Future;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{Error, ErrorKind, Read, Result};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-
 macro_rules! safe_syscall {
     ( $tty:expr ) => {{
         let res = unsafe { $tty };
@@ -169,14 +164,6 @@ impl Epoller {
         }
         Ok(())
     }
-    /*
-    pub fn spwan(
-        &self,
-        fu: impl Future<Output = ()> + 'static,
-    ) -> std::result::Result<(), SpawnError> {
-        self.executor.spawner().spawn_local_obj(Box::new(fu).into())
-    }
-    */
 }
 
 pub struct AsyncTcpListener {
@@ -194,8 +181,8 @@ impl AsyncTcpListener {
         self.listener.accept()
     }
 
-    pub fn async_accept(&self, epoller: Rc<RefCell<Epoller>>) -> AcceptFuture {
-        AcceptFuture::new(self, epoller)
+    pub fn async_accept(&self) -> AcceptFuture {
+        AcceptFuture { listener: self }
     }
 }
 
@@ -207,51 +194,8 @@ impl AsRawFd for AsyncTcpListener {
 
 pub struct AcceptFuture<'a> {
     listener: &'a AsyncTcpListener,
-    epoller: Rc<RefCell<Epoller>>,
 }
 
-impl<'a> AcceptFuture<'a> {
-    pub fn new(listener: &'a AsyncTcpListener, epoller: Rc<RefCell<Epoller>>) -> Self {
-        Self {
-            listener: listener,
-            epoller: epoller,
-        }
-    }
-}
-
-impl Stream for AcceptFuture<'_> {
-    type Item = Result<AsyncTcpStream>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.listener.accept() {
-            Ok((stream, addr)) => {
-                println!("new conn from:{}", addr);
-                return Poll::Ready(Some(stream.try_into()));
-            }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                println!("need wait");
-                // garanteed to has epoller
-                let mut_self = self.get_mut();
-                match mut_self.epoller.borrow_mut().register(
-                    mut_self.listener.as_raw_fd(),
-                    Interest::READ,
-                    cx.waker().clone(),
-                ) {
-                    Ok(_) => return Poll::Pending,
-                    Err(err) => {
-                        println!("wait new conn err:{}", err);
-                        return Poll::Ready(None);
-                    }
-                }
-            }
-            Err(err) => {
-                println!("accept err:{}", err);
-                return Poll::Ready(None);
-            }
-        }
-    }
-}
-
-/*
 impl Future for AcceptFuture<'_> {
     type Output = Result<AsyncTcpStream>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -264,7 +208,7 @@ impl Future for AcceptFuture<'_> {
                 // garanteed to has epoller
                 println!("need wait");
                 let mut_self = self.get_mut();
-                match mut_self.epoller.borrow_mut().register(
+                match runtime::epoller().borrow_mut().register(
                     mut_self.listener.as_raw_fd(),
                     Interest::READ,
                     cx.waker().clone(),
@@ -280,7 +224,6 @@ impl Future for AcceptFuture<'_> {
         }
     }
 }
-*/
 
 struct Buffer {
     data: [u8; 1024],
@@ -300,14 +243,9 @@ impl TryFrom<TcpStream> for AsyncTcpStream {
 }
 
 impl<'a, 'b> AsyncTcpStream {
-    pub fn async_read(
-        &'a mut self,
-        epoller: Rc<RefCell<Epoller>>,
-        buf: Rc<RefCell<&'b mut [u8]>>,
-    ) -> TcpReadFutrue<'a, 'b> {
+    pub fn async_read(&'a mut self, buf: &'b mut [u8]) -> TcpReadFutrue<'a, 'b> {
         return TcpReadFutrue {
             stream: self,
-            epoller: epoller,
             buf: buf,
         };
     }
@@ -325,28 +263,22 @@ impl AsRawFd for AsyncTcpStream {
 
 pub struct TcpReadFutrue<'a, 'b> {
     stream: &'a mut AsyncTcpStream,
-    epoller: Rc<RefCell<Epoller>>,
-    buf: Rc<RefCell<&'b mut [u8]>>,
+    buf: &'b mut [u8],
 }
 
-impl<'a, 'b> Stream for TcpReadFutrue<'a, 'b> {
-    type Item = Rc<RefCell<&'b mut [u8]>>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl<'a, 'b> Future for TcpReadFutrue<'a, 'b> {
+    type Output = Result<usize>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut_self = self.get_mut();
-        match mut_self.stream.read(&mut mut_self.buf.borrow_mut()) {
+        match mut_self.stream.read(mut_self.buf) {
             Ok(cnt) => {
-                if cnt == 0 {
-                    println!("eof");
-                    return Poll::Ready(None);
-                } else {
-                    println!("new data size:{}", cnt);
-                    return Poll::Ready(Some(mut_self.buf.clone()));
-                };
+                println!("data size:{}", cnt);
+                return Poll::Ready(Ok(cnt));
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 // garanteed to has epoller
                 println!("need wait data");
-                match mut_self.epoller.borrow_mut().register(
+                match runtime::epoller().borrow_mut().register(
                     mut_self.stream.as_raw_fd(),
                     Interest::READ,
                     cx.waker().clone(),
@@ -354,13 +286,13 @@ impl<'a, 'b> Stream for TcpReadFutrue<'a, 'b> {
                     Ok(_) => return Poll::Pending,
                     Err(err) => {
                         println!("register stream err:{}", err);
-                        return Poll::Ready(None);
+                        return Poll::Ready(Err(err));
                     }
                 }
             }
             Err(err) => {
                 println!("read tcp stream err:{}", err);
-                return Poll::Ready(None);
+                return Poll::Ready(Err(err));
             }
         }
     }
