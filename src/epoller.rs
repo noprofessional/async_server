@@ -5,9 +5,10 @@ use libc::*;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashMap;
-use std::future::Future;
+use std::convert::{TryFrom, TryInto};
+//use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, Read, Result};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -85,6 +86,7 @@ impl Epoller {
                     // modify to system
                     let new = old | interest_int;
 
+                    println!("new interest");
                     let mut ev = epoll_event {
                         events: new as u32,
                         u64: handle as u64,
@@ -97,9 +99,12 @@ impl Epoller {
                         &mut ev as *mut epoll_event
                     ))?;
                     self.interest_map.insert(handle, interest_int);
+                } else {
+                    println!("same interest");
                 }
             }
             None => {
+                println!("new handle");
                 // create new
                 let mut ev = epoll_event {
                     events: interest_int as u32,
@@ -189,7 +194,7 @@ impl AsyncTcpListener {
         self.listener.accept()
     }
 
-    pub fn async_accept(self, epoller: Rc<RefCell<Epoller>>) -> AcceptFuture {
+    pub fn async_accept(&self, epoller: Rc<RefCell<Epoller>>) -> AcceptFuture {
         AcceptFuture::new(self, epoller)
     }
 }
@@ -200,56 +205,60 @@ impl AsRawFd for AsyncTcpListener {
     }
 }
 
-pub struct AcceptFuture {
-    listener: AsyncTcpListener,
+pub struct AcceptFuture<'a> {
+    listener: &'a AsyncTcpListener,
     epoller: Rc<RefCell<Epoller>>,
-    stop: bool,
 }
 
-impl AcceptFuture {
-    pub fn new(listener: AsyncTcpListener, epoller: Rc<RefCell<Epoller>>) -> Self {
+impl<'a> AcceptFuture<'a> {
+    pub fn new(listener: &'a AsyncTcpListener, epoller: Rc<RefCell<Epoller>>) -> Self {
         Self {
             listener: listener,
             epoller: epoller,
-            stop: false,
         }
-    }
-}
-impl Stream for AcceptFuture {
-    type Item = Result<AsyncTcpStream>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        while !self.stop {
-            match self.listener.accept() {
-                Ok((stream, addr)) => {
-                    println!("new conn from:{}", addr);
-                    return Poll::Ready(Some(AsyncTcpStream::new(stream)));
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // garanteed to has epoller
-                    let mut_self = self.get_mut();
-                    match mut_self.epoller.borrow_mut().register(
-                        mut_self.listener.as_raw_fd(),
-                        Interest::READ,
-                        cx.waker().clone(),
-                    ) {
-                        Ok(_) => return Poll::Pending,
-                        Err(err) => return Poll::Ready(Some(Err(err))),
-                    }
-                }
-                Err(err) => return Poll::Ready(Some(Err(err))),
-            }
-        }
-        Poll::Ready(None)
     }
 }
 
-impl Future for AcceptFuture {
+impl Stream for AcceptFuture<'_> {
+    type Item = Result<AsyncTcpStream>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.listener.accept() {
+            Ok((stream, addr)) => {
+                println!("new conn from:{}", addr);
+                return Poll::Ready(Some(stream.try_into()));
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                println!("need wait");
+                // garanteed to has epoller
+                let mut_self = self.get_mut();
+                match mut_self.epoller.borrow_mut().register(
+                    mut_self.listener.as_raw_fd(),
+                    Interest::READ,
+                    cx.waker().clone(),
+                ) {
+                    Ok(_) => return Poll::Pending,
+                    Err(err) => {
+                        println!("wait new conn err:{}", err);
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+            Err(err) => {
+                println!("accept err:{}", err);
+                return Poll::Ready(None);
+            }
+        }
+    }
+}
+
+/*
+impl Future for AcceptFuture<'_> {
     type Output = Result<AsyncTcpStream>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 println!("new conn from:{}", addr);
-                return Poll::Ready(AsyncTcpStream::new(stream));
+                return Poll::Ready(stream.try_into());
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 // garanteed to has epoller
@@ -271,16 +280,88 @@ impl Future for AcceptFuture {
         }
     }
 }
+*/
 
+struct Buffer {
+    data: [u8; 1024],
+}
 #[derive(Debug)]
 pub struct AsyncTcpStream {
     stream: TcpStream,
 }
 
-impl AsyncTcpStream {
-    fn new(stream: TcpStream) -> Result<Self> {
+impl TryFrom<TcpStream> for AsyncTcpStream {
+    type Error = std::io::Error;
+    fn try_from(stream: TcpStream) -> Result<Self> {
         stream
             .set_nonblocking(true)
             .and_then(|_| Ok(Self { stream: stream }))
+    }
+}
+
+impl<'a, 'b> AsyncTcpStream {
+    pub fn async_read(
+        &'a mut self,
+        epoller: Rc<RefCell<Epoller>>,
+        buf: Rc<RefCell<&'b mut [u8]>>,
+    ) -> TcpReadFutrue<'a, 'b> {
+        return TcpReadFutrue {
+            stream: self,
+            epoller: epoller,
+            buf: buf,
+        };
+    }
+
+    fn read(&'a mut self, buf: &'b mut [u8]) -> Result<usize> {
+        return self.stream.read(buf);
+    }
+}
+
+impl AsRawFd for AsyncTcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        return self.stream.as_raw_fd();
+    }
+}
+
+pub struct TcpReadFutrue<'a, 'b> {
+    stream: &'a mut AsyncTcpStream,
+    epoller: Rc<RefCell<Epoller>>,
+    buf: Rc<RefCell<&'b mut [u8]>>,
+}
+
+impl<'a, 'b> Stream for TcpReadFutrue<'a, 'b> {
+    type Item = Rc<RefCell<&'b mut [u8]>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut_self = self.get_mut();
+        match mut_self.stream.read(&mut mut_self.buf.borrow_mut()) {
+            Ok(cnt) => {
+                if cnt == 0 {
+                    println!("eof");
+                    return Poll::Ready(None);
+                } else {
+                    println!("new data size:{}", cnt);
+                    return Poll::Ready(Some(mut_self.buf.clone()));
+                };
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                // garanteed to has epoller
+                println!("need wait data");
+                match mut_self.epoller.borrow_mut().register(
+                    mut_self.stream.as_raw_fd(),
+                    Interest::READ,
+                    cx.waker().clone(),
+                ) {
+                    Ok(_) => return Poll::Pending,
+                    Err(err) => {
+                        println!("register stream err:{}", err);
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+            Err(err) => {
+                println!("read tcp stream err:{}", err);
+                return Poll::Ready(None);
+            }
+        }
     }
 }
