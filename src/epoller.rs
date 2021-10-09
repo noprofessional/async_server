@@ -2,7 +2,6 @@ use crate::runtime;
 use libc::*;
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashMap;
-use std::convert::{TryFrom, TryInto};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{Error, ErrorKind, Read, Result};
@@ -10,6 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
+
 macro_rules! safe_syscall {
     ( $tty:expr ) => {{
         let res = unsafe { $tty };
@@ -202,7 +202,7 @@ impl Future for AcceptFuture<'_> {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 println!("new conn from:{}", addr);
-                return Poll::Ready(stream.try_into());
+                return Poll::Ready(AsyncTcpStream::from_std(stream));
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 // garanteed to has epoller
@@ -233,24 +233,21 @@ pub struct AsyncTcpStream {
     stream: TcpStream,
 }
 
-impl TryFrom<TcpStream> for AsyncTcpStream {
-    type Error = std::io::Error;
-    fn try_from(stream: TcpStream) -> Result<Self> {
+impl AsyncTcpStream {
+    fn from_std(stream: TcpStream) -> Result<Self> {
         stream
             .set_nonblocking(true)
             .and_then(|_| Ok(Self { stream: stream }))
     }
-}
 
-impl<'a, 'b> AsyncTcpStream {
-    pub fn async_read(&'a mut self, buf: &'b mut [u8]) -> TcpReadFutrue<'a, 'b> {
+    pub fn async_read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> TcpReadFutrue<'a, 'b> {
         return TcpReadFutrue {
             stream: self,
             buf: buf,
         };
     }
 
-    fn read(&'a mut self, buf: &'b mut [u8]) -> Result<usize> {
+    fn read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> Result<usize> {
         return self.stream.read(buf);
     }
 }
