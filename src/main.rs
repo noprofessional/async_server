@@ -5,26 +5,34 @@ use async_server::runtime;
 //use std::cell::RefCell;
 //use std::rc::Rc;
 
-async fn echo_task() {
+// provide service on fixed port
+async fn echo_service() {
     let listener = AsyncTcpListener::bind("0.0.0.0:23333").unwrap();
     loop {
-        let mut stream = listener.async_accept().await.unwrap();
+        let stream = listener.async_accept().await.unwrap();
         println!("new conn:{:?}", stream);
-        runtime::spawn_task(async move {
-            let mut buf: [u8; 1024] = [0; 1024];
-            let mut cnt = stream.async_read(&mut buf[..]).await.unwrap();
-            while cnt != 0 {
-                println!("recv: {}", String::from_utf8_lossy(&buf[0..cnt]));
-                cnt = stream.async_read(&mut buf[..]).await.unwrap();
-            }
-            //stream.async_write(&buf[0..cnt]).await.unwrap();
-        })
-        .unwrap();
+
+        // create new task for every connection
+        runtime::spawn_task(echo_task(stream)).unwrap();
+    }
+}
+
+async fn echo_task(mut stream: AsyncTcpStream) {
+    let mut buf: [u8; 1024] = [0; 1024];
+    loop {
+        let cnt = stream.async_read(&mut buf[..]).await.unwrap();
+        if cnt != 0 {
+            println!("recv: {}", String::from_utf8_lossy(&buf[0..cnt]));
+        } else {
+            // connection breaks
+            println!("closed:{:?}", stream);
+            break;
+        }
     }
 }
 
 fn main() -> Result<()> {
-    runtime::spawn_task(echo_task())?;
+    runtime::spawn_task(echo_service())?;
     runtime::run()?;
     Ok(())
 }
