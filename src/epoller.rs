@@ -20,6 +20,8 @@ macro_rules! safe_syscall {
     }};
 }
 
+const INNER_BUFFER_LIMIT: usize = 10 * 1024 * 1024; // 10M
+
 #[derive(Clone, Copy)]
 enum Interest {
     READ,
@@ -232,19 +234,41 @@ impl Future for AcceptFuture<'_> {
     }
 }
 
+#[derive(Debug)]
 struct Buffer {
-    data: [u8; 1024],
+    limit: usize,
+    buf: Vec<u8>,
 }
+
+impl Buffer {
+    fn new_with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit,
+            buf: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+}
+
 #[derive(Debug)]
 pub struct AsyncTcpStream {
     stream: TcpStream,
+    outbuffer: Buffer,
+    inbuffer: Buffer,
 }
 
 impl AsyncTcpStream {
     fn from_std(stream: TcpStream) -> Result<Self> {
-        stream
-            .set_nonblocking(true)
-            .and_then(|_| Ok(Self { stream: stream }))
+        stream.set_nonblocking(true).and_then(|_| {
+            Ok(Self {
+                stream: stream,
+                outbuffer: Buffer::new_with_limit(INNER_BUFFER_LIMIT),
+                inbuffer: Buffer::new_with_limit(INNER_BUFFER_LIMIT),
+            })
+        })
     }
 
     pub fn async_read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> TcpReadFutrue<'a, 'b> {
