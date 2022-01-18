@@ -271,8 +271,8 @@ impl AsyncTcpStream {
         })
     }
 
-    pub fn async_read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> TcpReadFutrue<'a, 'b> {
-        return TcpReadFutrue {
+    pub fn async_read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> TcpReadFuture<'a, 'b> {
+        return TcpReadFuture {
             stream: self,
             buf: buf,
         };
@@ -289,12 +289,12 @@ impl AsRawFd for AsyncTcpStream {
     }
 }
 
-pub struct TcpReadFutrue<'a, 'b> {
+pub struct TcpReadFuture<'a, 'b> {
     stream: &'a mut AsyncTcpStream,
     buf: &'b mut [u8],
 }
 
-impl<'a, 'b> Future for TcpReadFutrue<'a, 'b> {
+impl<'a, 'b> Future for TcpReadFuture<'a, 'b> {
     type Output = Result<usize>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut_self = self.get_mut();
