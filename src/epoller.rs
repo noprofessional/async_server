@@ -251,6 +251,18 @@ impl Buffer {
     fn append(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
     }
+
+    fn data(&self) -> &[u8] {
+        &self.buf[..]
+    }
+
+    fn free_space(&mut self) -> &[u8] {
+        &self.buf[..]
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
 }
 
 #[derive(Debug)]
@@ -258,6 +270,7 @@ pub struct AsyncTcpStream {
     stream: TcpStream,
     outbuffer: Buffer,
     inbuffer: Buffer,
+    closed: bool,
 }
 
 impl AsyncTcpStream {
@@ -267,6 +280,7 @@ impl AsyncTcpStream {
                 stream: stream,
                 outbuffer: Buffer::new_with_limit(INNER_BUFFER_LIMIT),
                 inbuffer: Buffer::new_with_limit(INNER_BUFFER_LIMIT),
+                closed: false,
             })
         })
     }
@@ -278,6 +292,40 @@ impl AsyncTcpStream {
         };
     }
 
+    async fn read_all(&mut self) -> Result<&[u8]> {
+        if self.inbuffer.len() > 0 {
+            return Ok(self.inbuffer.data());
+        } else if self.closed {
+            return Ok(self.inbuffer.data());
+        } else {
+            let res = self.read_future().await;
+            let data = self.inbuffer.data();
+            res.map(|_cnt| data)
+        }
+    }
+
+    pub fn read_future<'a>(&'a mut self) -> TcpReadFuture2<'a> {
+        TcpReadFuture2 { stream: self }
+    }
+
+    fn read_to_inbuffer(&mut self) -> Result<usize> {
+        let mut buffer: [u8; 1024] = [0; 1024];
+        loop {
+            match self.stream.read(&mut buffer[..]) {
+                Ok(size) => {
+                    if size == 0 {
+                        return Ok(self.inbuffer.len());
+                    } else {
+                        self.inbuffer.append(&buffer[..]);
+                    }
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     fn read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> Result<usize> {
         return self.stream.read(buf);
     }
@@ -286,6 +334,41 @@ impl AsyncTcpStream {
 impl AsRawFd for AsyncTcpStream {
     fn as_raw_fd(&self) -> RawFd {
         return self.stream.as_raw_fd();
+    }
+}
+pub struct TcpReadFuture2<'a> {
+    stream: &'a mut AsyncTcpStream,
+}
+
+impl<'a> Future for TcpReadFuture2<'a> {
+    type Output = Result<usize>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut_self = self.get_mut();
+        match mut_self.stream.read_to_inbuffer() {
+            Ok(cnt) => {
+                println!("data size:{}", cnt);
+                return Poll::Ready(Ok(cnt));
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                // garanteed to has epoller
+                println!("need wait data");
+                match runtime::epoller().borrow_mut().register(
+                    mut_self.stream.as_raw_fd(),
+                    Interest::READ,
+                    cx.waker().clone(),
+                ) {
+                    Ok(_) => return Poll::Pending,
+                    Err(err) => {
+                        println!("register stream err:{}", err);
+                        return Poll::Ready(Err(err));
+                    }
+                }
+            }
+            Err(err) => {
+                println!("read tcp stream err:{}", err);
+                return Poll::Ready(Err(err));
+            }
+        }
     }
 }
 
