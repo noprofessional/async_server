@@ -72,6 +72,10 @@ impl Epoller {
         })
     }
 
+    fn register_once(&mut self, _handle: RawFd, _interest: Interest) -> Result<()> {
+        Ok(())
+    }
+
     fn register(&mut self, handle: RawFd, interest: Interest, waker: Waker) -> Result<()> {
         let interest_int = interest.to_cint();
         let val = self.interest_map.get(&handle);
@@ -174,6 +178,9 @@ impl AsyncTcpListener {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
+        runtime::epoller()
+            .borrow_mut()
+            .register_once(listener.as_raw_fd(), Interest::READ)?;
         Ok(Self { listener: listener })
     }
 
