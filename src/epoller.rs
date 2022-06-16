@@ -1,5 +1,6 @@
 use crate::runtime;
 use libc::*;
+use std::borrow::BorrowMut;
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashMap;
 use std::future::Future;
@@ -8,6 +9,8 @@ use std::io::{Error, ErrorKind, Read, Result};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
+use std::ptr;
+use std::rc::Weak;
 use std::task::{Context, Poll, Waker};
 
 macro_rules! safe_syscall {
@@ -50,6 +53,35 @@ impl Hash for Interest {
     }
 }
 
+pub(crate) struct IoHandle {
+    uniq_id: u64,
+    system_handle: RawFd,
+    interest: u32,
+}
+
+impl AsRawFd for IoHandle {
+    fn as_raw_fd(&self) -> RawFd {
+        return self.system_handle;
+    }
+}
+
+impl Hash for IoHandle {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.uniq_id.hash(state);
+    }
+}
+
+impl IoHandle {
+    fn get_interest(&self) -> u32 {
+        return self.interest;
+    }
+
+    fn on_event(&mut self, events: u32) {}
+}
+
 pub struct Epoller {
     stop: bool,
     epoll_fd: RawFd,
@@ -57,6 +89,7 @@ pub struct Epoller {
     interest_map: HashMap<RawFd, c_int>,
     waker_map: HashMap<RawFd, HashMap<Interest, Option<Waker>>>,
     //executor: LocalPool,
+    io_handles: HashMap<u64, Weak<IoHandle>>,
 }
 
 impl Epoller {
@@ -69,6 +102,7 @@ impl Epoller {
             interest_map: HashMap::new(),
             waker_map: HashMap::new(),
             //executor: LocalPool::new(),
+            io_handles: HashMap::new(),
         })
     }
 
@@ -161,6 +195,60 @@ impl Epoller {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ctl(&mut self, handle: Weak<IoHandle>, op: i32) -> Result<()> {
+        //nothing
+        let handle = handle.upgrade().unwrap();
+
+        if op as c_int == EPOLL_CTL_DEL {
+            safe_syscall!(epoll_ctl(
+                self.epoll_fd,
+                op as c_int,
+                handle.as_raw_fd() as c_int,
+                ptr::null_mut(),
+            ))
+            .and_then(|_| {
+                self.io_handles.remove(&handle.uniq_id);
+                Ok(())
+            })
+        } else {
+            let mut ev = epoll_event {
+                events: handle.get_interest() as u32,
+                u64: handle.uniq_id,
+            };
+
+            safe_syscall!(epoll_ctl(
+                self.epoll_fd,
+                op as c_int,
+                handle.as_raw_fd() as c_int,
+                &mut ev as *mut epoll_event
+            ))
+            .and_then(|_| {
+                self.io_handles
+                    .insert(handle.uniq_id, std::rc::Rc::downgrade(&handle));
+                Ok(())
+            })
+        }
+    }
+
+    pub(crate) fn run_once(&mut self) -> Result<()> {
+        let cnt = safe_syscall!(epoll_wait(
+            self.epoll_fd,
+            &mut self.event_buf as *mut epoll_event,
+            1024,
+            -1,
+        ))?;
+
+        println!("ready {}", cnt);
+        for i in 0..cnt as usize {
+            let uniq_id = self.event_buf[i].u64 as u64;
+            let events = self.event_buf[i].events;
+
+            let handle = self.io_handles.get(&uniq_id).unwrap().upgrade().unwrap();
+            handle.borrow_mut().on_event(events);
         }
         Ok(())
     }
